@@ -17,7 +17,7 @@ wandbconfig:
 # Dataset Config
 # -------------------------------
 dataconfig:
-  data_path: data/au_fineweb_00000.parquet #to be edited
+  data_path: data/au_fineweb_00000.parquet # to be edited
   batch_size: 16
   num_workers: 4
   shuffle: false
