@@ -35,3 +35,10 @@ def _build_bnb_config(model_cfg: DictConfig, bf16: bool) -> Optional[BitsAndByte
         bnb_4bit_quant_type=str(getattr(model_cfg, "bnb_4bit_quant_type", "nf4")),
         bnb_4bit_compute_dtype=compute_dtype,
     )
+
+
+def _print_trainable_params(model) -> None:
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    pct = 100.0 * trainable / max(1, total)
+    print(f"🔧 Trainable parameters: {trainable:,} / {total:,} ({pct:.2f}%)")
