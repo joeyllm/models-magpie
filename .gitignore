@@ -1,0 +1,16 @@
+### Python ###
+__pycache__/
+*.py[cod]
+*.so
+
+### Jupyter Notebooks ###
+.ipynb_checkpoints
+
+### Environments ###
+.env
+.venv
+env/
+venv/
+
+### PyTorch & Transformers cache ###
+~/.cache/
