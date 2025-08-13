@@ -9,9 +9,9 @@ defaults:
 # WandB Config
 # -------------------------------
 wandbconfig:
-  project: MistralAU
-  name: mistral-lora-au
-  mode: offline  # "online", "offline", or "disabled"
+  project: Mistral7B_AU
+  name: qlora-bf16
+  mode: offline   # "online", "offline", or "disabled"
 
 # -------------------------------
 # Dataset Config
@@ -23,13 +23,14 @@ dataconfig:
   shuffle: false
   drop_last: true
   pin_memory: true
+  max_seq_len: 4096
 
 # -------------------------------
 # Model Config
 # -------------------------------
 modelconfig:
   name: mistralai/Mistral-7B-v0.1
-  load_in_4bit: false # Enable 4-bit quantization
+  load_in_4bit: true # Enable 4-bit quantization
   lora_r: 8 
   lora_alpha: 32
   lora_dropout: 0.05
@@ -47,22 +48,22 @@ optimizerconfig:
 # Trainer Config
 # -------------------------------
 trainconfig:
-  total_steps: 5000
-  epochs: 10
-  accumulation_steps: 4
-  save_model_path: model/mistral_lora.pt
-  log_freq: 50
+  epochs: 1
+  total_steps: 0            # 0 -> let Trainer compute from dataset
+  accumulation_steps: 16
+  output_dir: checkpoints/mistral7b-au
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 2
+  gradient_checkpointing: true
+  bf16: true
+  seed: 42
+  packing: true             # pack multiple examples per sequence
 
 # -------------------------------
 # Scheduler Config
 # -------------------------------
 schedulerconfig:
-  max_lr: 2e-4
-  pct_start: 0.01
-  anneal_strategy: cos
-  div_factor: 25.0
-  final_div_factor: 10000.0
-  cycle_momentum: true
-  base_momentum: 0.85
-  max_momentum: 0.95
-  three_phase: false
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  max_grad_norm: 0.3
