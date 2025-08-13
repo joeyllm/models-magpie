@@ -1,1 +1,1 @@
-from .model import aus_mistral_7b
+import aus_mistral_7b

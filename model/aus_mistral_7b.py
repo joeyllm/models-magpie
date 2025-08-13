@@ -42,6 +42,6 @@ def load_mistral_model(model_cfg: DictConfig, device_map=None):
     # Print trainable parameters
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"🔧 Trainable parameters: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
+    print(f"Trainable parameters: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
     return model
