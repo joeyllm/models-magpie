@@ -29,4 +29,45 @@ class ModelConfig(BaseModel):
     target_modules: List[str]
 
 
+class OptimizerConfig(BaseModel):
+    lr: float = Field(..., gt=0)
+    betas: Tuple[float, float]
+    weight_decay: float = Field(..., ge=0.0)
 
+
+class TrainConfig(BaseModel):
+    epochs: int = Field(..., gt=0)
+    total_steps: int = Field(0, ge=0)
+    accumulation_steps: int = Field(..., gt=0)
+    output_dir: str
+    logging_steps: int = Field(..., gt=0)
+    save_steps: int = Field(..., gt=0)
+    save_total_limit: int = Field(..., ge=0)
+    gradient_checkpointing: bool
+    bf16: bool
+    seed: int
+    packing: bool
+
+
+class SchedulerConfig(BaseModel):
+    lr_scheduler_type: Literal[
+        "linear",
+        "cosine",
+        "cosine_with_restarts",
+        "polynomial",
+        "constant",
+        "constant_with_warmup"
+    ]
+    warmup_ratio: float = Field(..., ge=0.0, le=1.0)
+    max_grad_norm: float = Field(..., ge=0.0)
+
+
+# ---------- Root Config ----------
+
+class Config(BaseModel):
+    wandbconfig: WandBConfig
+    dataconfig: DataConfig
+    modelconfig: ModelConfig
+    optimizerconfig: OptimizerConfig
+    trainconfig: TrainConfig
+    schedulerconfig: SchedulerConfig
