@@ -7,11 +7,14 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import Module
 from torch.amp import autocast, GradScaler
+import json
 
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 except Exception:
     FSDP = None
+from peft.utils.save_and_load import get_peft_model_state_dict
 
 
 class Trainer:
@@ -29,6 +32,7 @@ class Trainer:
         save_model_path: str,               # base output_dir
         log_freq: int,
         save_steps: int,                    # checkpoint every N steps
+        max_grad_norm: float,
         use_bf16: bool = True,
         device: Optional[torch.device] = None,
         save_optimizer_state: bool = False, # toggle to also save opt/sched state_dict
@@ -46,7 +50,7 @@ class Trainer:
         self.log_freq = log_freq
         self.save_steps = max(1, save_steps)
         self.save_optimizer_state = save_optimizer_state
-
+        self.max_grad_norm = float(max_grad_norm)
         self.global_step = 0
         self.best_loss = math.inf
 
@@ -75,49 +79,41 @@ class Trainer:
         ckpt_dir = os.path.join(self.output_dir, f"ckpt-{tag}")
         os.makedirs(ckpt_dir, exist_ok=True)
 
-        unwrapped = self._unwrap(self.model)
-
-        # Prefer PEFT adapter saving
-        saved = False
         try:
-            if hasattr(unwrapped, "peft_config"):
-                unwrapped.save_pretrained(ckpt_dir)
-                saved = True
+            model_for_sd = self.model  # could be FSDP-wrapped
+            unwrapped = getattr(model_for_sd, "module", model_for_sd)
+
+            # 1) Build a CPU, rank0-only full state_dict if FSDP is present and the model is wrapped
+            use_fsdp_ctx = FSDP is not None and isinstance(model_for_sd, FSDP)
+            if use_fsdp_ctx:
+                full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(model_for_sd, StateDictType.FULL_STATE_DICT, full_cfg):
+                    base_sd = model_for_sd.state_dict()
+            else:
+                # Not wrapped (or FSDP not available) → normal CPU state_dict
+                base_sd = {k: v.cpu() for k, v in model_for_sd.state_dict().items()}
+
+            # 2) Filter to adapter-only weights (LoRA)
+            peft_sd = get_peft_model_state_dict(model_for_sd, state_dict=base_sd)
+
+            # 3) Let PEFT write everything (adapter_model.safetensors + adapter_config.json)
+            unwrapped.save_pretrained(
+                ckpt_dir,
+                state_dict=peft_sd,
+                safe_serialization=True,
+            )
+
+            # 4) Small training meta
+            torch.save(
+                {"global_step": self.global_step, "best_loss": self.best_loss, "metrics": metrics or {}},
+                os.path.join(ckpt_dir, "training_state.pt"),
+            )
+
+            self.logger.print(f"✅ Adapter checkpoint saved at: {ckpt_dir}")
+
         except Exception as e:
-            self.logger.print(f"Adapter save failed, falling back to state_dict: {e}")
+            self.logger.print(f"❌ Adapter checkpoint failed: {e}")
 
-        if not saved:
-            # Fallback: full (sharded) state_dict is fine for small adapters; for FSDP full model this may be large
-            try:
-                torch.save(unwrapped.state_dict(), os.path.join(ckpt_dir, "pytorch_model.bin"))
-                saved = True
-            except Exception as e:
-                self.logger.print(f"Failed to save model state_dict: {e}")
-
-        # Save training states
-        if self.save_optimizer_state:
-            try:
-                torch.save(self.optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
-            except Exception as e:
-                self.logger.print(f"Failed to save optimizer state: {e}")
-            if self.scheduler is not None:
-                try:
-                    torch.save(self.scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
-                except Exception as e:
-                    self.logger.print(f"Failed to save scheduler state: {e}")
-
-        # Save small training meta
-        info = {
-            "global_step": self.global_step,
-            "best_loss": self.best_loss,
-            "metrics": metrics or {},
-        }
-        try:
-            torch.save(info, os.path.join(ckpt_dir, "training_state.pt"))
-        except Exception as e:
-            self.logger.print(f"Failed to save training_state: {e}")
-
-        self.logger.print(f"Checkpoint saved at: {ckpt_dir}")
 
     def checkpoint_step(self, loss_val: float):
         if (self.global_step % self.save_steps) == 0 and self.global_step > 0:
@@ -198,12 +194,19 @@ class Trainer:
 
             if is_accum_end:
                 if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
+                lr = self.optimizer.param_groups[0]["lr"]
+                if self.logger.is_main and (step % self.accumulation_steps) == 0:
+                    self.logger.wb("log", metrics={"train/lr": lr}, step=self.global_step)
+                
 
             self.global_step += 1
 
