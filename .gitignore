@@ -14,3 +14,15 @@ venv/
 
 ### PyTorch & Transformers cache ###
 ~/.cache/
+~.hf_cache/*
+hf_cache/*
+huggingface/
+models/
+outputs/
+/.hf_cache/
+wandb/
+
+
+
+temp.txt
+checkpoints/

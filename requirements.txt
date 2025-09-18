@@ -7,5 +7,14 @@ datasets
 accelerate
 
 tqdm
+rich
 numpy
 pandas
+
+bitsandbytes
+peft
+wandb
+hydra-core 
+omegaconf 
+pydantic
+sentencepiece
