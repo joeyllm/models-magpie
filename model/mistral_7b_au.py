@@ -1,10 +1,11 @@
+# model/mistral_7b_au.py
 from __future__ import annotations
 from typing import Optional
-
+import os
 import torch
 from omegaconf import DictConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 DEFAULT_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -86,13 +87,18 @@ def load_mistral_model(
     Returns:
         model, tokenizer
     """
+    token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+    if use_fsdp and getattr(model_cfg, "load_in_4bit", False):
+        quantization_config = None
+
     name = getattr(model_cfg, "name")
     trust_remote_code = bool(getattr(model_cfg, "trust_remote_code", True))
     bf16 = bool(getattr(train_cfg, "bf16", True)) if train_cfg is not None else True
     grad_ckpt = bool(getattr(train_cfg, "gradient_checkpointing", True)) if train_cfg is not None else True
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True, trust_remote_code=trust_remote_code,token=token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -109,6 +115,12 @@ def load_mistral_model(
         torch_dtype=_to_dtype(bf16),
         device_map=dm,
         quantization_config=quantization_config,
+        token=token
+    )
+
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=grad_ckpt
     )
 
     # Apply LoRA (QLoRA)
@@ -117,8 +129,11 @@ def load_mistral_model(
     # Enable grad checkpointing and disable cache for training
     if grad_ckpt:
         model.gradient_checkpointing_enable()
+        # ✅ Important with PEFT + checkpointing:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         if hasattr(model, "config"):
-            model.config.use_cache = False  # important for checkpointing
+            model.config.use_cache = False
 
     _print_trainable_params(model)
     return model, tokenizer
