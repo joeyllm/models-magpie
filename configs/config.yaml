@@ -1,3 +1,4 @@
+# configs/config.yaml
 # ===============================
 # Mistral 7B Fine-Tuning Config
 # ===============================
@@ -9,28 +10,29 @@ defaults:
 # WandB Config
 # -------------------------------
 wandbconfig:
-  project: Mistral7B_AU
-  name: qlora-bf16
-  mode: offline   # "online", "offline", or "disabled"
+  project: Magpie-Test-01
+  entity: JoeyLLM
+  name: lora-bf16-fsdp-test
+  mode: disabled   # "online", "offline", or "disabled"
 
 # -------------------------------
 # Dataset Config
 # -------------------------------
 dataconfig:
-  data_path: data/au_fineweb_00000.parquet # to be edited
-  batch_size: 16
-  num_workers: 4
+  data_path: outputs/data/ # Contains folders that have the parquet files
+  batch_size: 2
+  num_workers: 8
   shuffle: false
   drop_last: true
   pin_memory: true
-  max_seq_len: 4096
+  max_seq_len: 1024
 
 # -------------------------------
 # Model Config
 # -------------------------------
 modelconfig:
-  name: mistralai/Mistral-7B-v0.1
-  load_in_4bit: true # Enable 4-bit quantization
+  name: mistralai/Mistral-7B-v0.3
+  load_in_4bit: true 
   lora_r: 8 
   lora_alpha: 32
   lora_dropout: 0.05
@@ -40,7 +42,7 @@ modelconfig:
 # Optimizer Config
 # -------------------------------
 optimizerconfig:
-  lr: 2e-4
+  lr: 5e-5
   betas: [0.9, 0.95]
   weight_decay: 0.01
 
@@ -50,10 +52,10 @@ optimizerconfig:
 trainconfig:
   epochs: 1
   total_steps: 0            # 0 -> let Trainer compute from dataset
-  accumulation_steps: 16
+  accumulation_steps: 8
   output_dir: checkpoints/mistral7b-au
   logging_steps: 10
-  save_steps: 500
+  save_steps: 2000
   save_total_limit: 2
   gradient_checkpointing: true
   bf16: true
@@ -65,5 +67,5 @@ trainconfig:
 # -------------------------------
 schedulerconfig:
   lr_scheduler_type: cosine
-  warmup_ratio: 0.03
+  warmup_ratio: 0.2
   max_grad_norm: 0.3
