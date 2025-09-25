@@ -17,7 +17,7 @@ from model.mistral_7b_au import load_mistral_model
 from train.trainer import Trainer
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
+torch.cuda.empty_cache()
 # -------------- utils --------------
 
 class Logger:

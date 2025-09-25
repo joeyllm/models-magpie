@@ -23,6 +23,7 @@ outputs/
 wandb/
 
 
-
+### Logs
 temp.txt
 checkpoints/
+logs/

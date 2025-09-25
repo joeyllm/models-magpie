@@ -73,8 +73,8 @@ class Trainer:
         return getattr(m, "module", m)
 
     def _save_checkpoint(self, tag: str, metrics: Optional[Dict[str, float]] = None):
-        if self.rank != 0:
-            return
+        # if self.rank != 0:
+        #     return
 
         ckpt_dir = os.path.join(self.output_dir, f"ckpt-{tag}")
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -188,6 +188,15 @@ class Trainer:
                     lr = self.optimizer.param_groups[0]["lr"]
                     self.logger.print(f"Epoch {epoch} Step {step} Loss: {loss.item():.4f} LR: {lr:.6f}")
                     self.logger.wb("log", metrics={"train/loss": loss.item(), "train/lr": lr}, step=self.global_step)
+
+                if not torch.isfinite(loss):
+                    if self.logger.is_main:
+                        self.logger.print(f"⚠️ Non-finite loss at step {self.global_step}: {loss.item()} — skipping.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    self.global_step += 1
+                    continue
 
                 loss = loss / self.accumulation_steps
                 _backward_scaled(loss)
