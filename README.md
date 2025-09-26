@@ -56,3 +56,35 @@ This repository contains code, configurations, and documentation for fine-tuning
 - Improve performance on tasks with localised terminology, cultural references, and spelling conventions (e.g., "organise" vs. "organize")
 - Evaluate downstream improvements in generation and comprehension on Australian-specific tasks
 
+## Notes 26/09/25
+
+building off of main_fsdp.py 
+
+when running torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 main_fsdp.py
+
+get the error
+requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: https://huggingface.co/mistralai/Mistral-7B-v0.3/resolve/main/config.json
+
+either lacking authentication or dont have model access on huggingface
+
+running 
+TRANSFORMERS_OFFLINE=1 torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 main_fsdp.py
+does not resolve the issue.
+
+the model seems to be located in .hf_cache/hub/models--mistralai--Mistral-7B-v0.3 but am unsure how to configure the project to use it.
+
+export HUGGINGFACE_HUB_TOKEN=hf_XXXXXX
+
+get warning \`torch_dtype\` is depricated! Use \`dtype\` instead!
+
+line 149 model = FSDP(...
+ValueError: Cannot flatten integer dtype tensors
+
+export HYDRA_FULL_ERROR=1 // for more detailed logs
+
+need to modify auto_wrap_policy to ignore the KV caches because the FSDP wrapper seems to be interpreting those values as trainable weights. leading to error with trying to flatten dtype tensors. 
+
+after fixing that there seems to be an issue with permissions 
+
+Cannot access gated repo for url https://huggingface.co/mistralai/Mistral-7B-v0.3/resolve/main/config.json.
+Access to model mistralai/Mistral-7B-v0.3 is restricted. You must have access to it and be authenticated to access it. Please log in. - silently ignoring the lookup for the file config.json in mistralai/Mistral-7B-v0.3.

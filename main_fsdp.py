@@ -74,6 +74,14 @@ def tokenize_batch(examples, tok, max_len: int):
         return_attention_mask=True,
     )
 
+def fix_non_float_params(module):
+    for name, param in list(module.named_parameters(recurse=False)):
+        if param.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            del module._parameters[name]
+            module.register_buffer(name, param.data)
+
+    for child in module.children():
+        fix_non_float_params(child)
 
 # --------------- main ------------------
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -145,6 +153,9 @@ def main(cfg: DictConfig):
 
     # Move base to the correct CUDA before wrapping (helps with some PEFT/bnb combinations)
     model.to(device)
+
+    # Apply fix before FSDP wrapping
+    fix_non_float_params(model)
 
     model = FSDP(
         model,
