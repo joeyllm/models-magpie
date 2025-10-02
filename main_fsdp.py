@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
-
+import datetime
 import hydra
 import wandb
 from omegaconf import DictConfig, OmegaConf
@@ -26,13 +26,68 @@ from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 
 from functools import partial
 
+from contextlib import nullcontext
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # ---------------- utils ----------------
+
+class StrictCausalCollator:
+    def __init__(self, tokenizer, pad_to_multiple_of: int | None = 8):
+        self.tok = tokenizer
+        self.mult = pad_to_multiple_of
+    def __call__(self, features):
+        batch = self.tok.pad(features, padding="longest",
+                             pad_to_multiple_of=self.mult, return_tensors="pt")
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask",
+                                   (input_ids != self.tok.pad_token_id).long())
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+        return {"input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels}
+
+def save_full_model_after_fsdp(model, tokenizer, out_dir: str, rank: int):
+    """
+    Gathers full params on rank 0, merges LoRA into base (if present), and saves a full HF model.
+    Safe for FSDP and non-FSDP. Other ranks are no-ops.
+    """
+    try:
+        from peft import PeftModel
+        has_peft = True
+    except Exception:
+        PeftModel = tuple()  # empty tuple so isinstance(..., PeftModel) is False
+        has_peft = False
+
+    # Choose summon context if model is FSDP
+    if isinstance(model, FSDP):
+        summon_ctx = FSDP.summon_full_params(model, writeback=False, rank0_only=True)
+    else:
+        summon_ctx = nullcontext()
+
+    with summon_ctx:
+        if rank == 0:
+            os.makedirs(out_dir, exist_ok=True)
+            base = getattr(model, "module", model)  # unwrap if FSDP
+
+            # If it's a PEFT/LoRA model, merge adapters into the base weights
+            if has_peft and isinstance(base, PeftModel):
+                base = base.merge_and_unload()  # returns a plain HF model with merged weights
+
+            # Save HF model + tokenizer (safetensors)
+            base.save_pretrained(out_dir, safe_serialization=True)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(out_dir)
+            print(f"💾 Full model (merged) saved to: {out_dir}")
+
+
 class Logger:
     def __init__(self, run, is_main: bool = True):
         self.run = run
@@ -94,7 +149,7 @@ def main(cfg: DictConfig):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank, timeout=datetime.timedelta(minutes=30),)
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
@@ -145,11 +200,17 @@ def main(cfg: DictConfig):
         transformer_layer_cls={MistralDecoderLayer},   # wrap each decoder block
     )
 
+    # mp_policy = MixedPrecision(
+    #     param_dtype=torch.bfloat16 if cfg["trainconfig"]["bf16"] else torch.float16,
+    #     reduce_dtype=torch.float32,     # <— change to fp32 for stability
+    #     buffer_dtype=torch.bfloat16 if cfg["trainconfig"]["bf16"] else torch.float16,
+    # )
+
+    use_bf16 = bool(cfg["trainconfig"]["bf16"])
+    
     mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16 if cfg["trainconfig"]["bf16"] else torch.float16,
-        reduce_dtype=torch.float32,     # <— change to fp32 for stability
-        buffer_dtype=torch.bfloat16 if cfg["trainconfig"]["bf16"] else torch.float16,
-    )
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16
+    ) if use_bf16 else None
 
     # Move base to the correct CUDA before wrapping (helps with some PEFT/bnb combinations)
     model.to(device)
@@ -160,10 +221,13 @@ def main(cfg: DictConfig):
     model = FSDP(
         model,
         auto_wrap_policy=auto_wrap,
-        mixed_precision=mp_policy,
+        mixed_precision=None, # mp_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         use_orig_params=True,
         device_id=device,
+        limit_all_gathers=True,         
+        forward_prefetch=False,         
+        sync_module_states=True,      
     )
 
     if rank == 0:
@@ -180,11 +244,14 @@ def main(cfg: DictConfig):
         desc="Tokenizing" if rank == 0 else None,
     )
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-        pad_to_multiple_of=8,
-    )
+    # data_collator = DataCollatorForLanguageModeling(
+    #     tokenizer=tokenizer,
+    #     mlm=False,
+    #     pad_to_multiple_of=8,
+    # )
+
+    data_collator = StrictCausalCollator(tokenizer, pad_to_multiple_of=8)
+
 
     if rank == 0:
         logger.print("🧰 Building DataLoader + DistributedSampler...")
@@ -253,6 +320,13 @@ def main(cfg: DictConfig):
     )
 
     trainer.train(int(cfg["trainconfig"]["epochs"]))
+
+    # Save a final full model (merged LoRA → base) on rank 0
+    final_out = os.path.join(cfg["trainconfig"]["output_dir"], "final-full-model")
+    save_full_model_after_fsdp(model, tokenizer, final_out, rank)
+
+    # Sync ranks before tearing down
+    dist.barrier()
 
     # Clean finalize
     if rank == 0 and run is not None:

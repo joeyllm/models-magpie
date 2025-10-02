@@ -7,6 +7,8 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import Module
 from torch.amp import autocast, GradScaler
+import json
+
 from contextlib import nullcontext
 
 try:
@@ -14,34 +16,11 @@ try:
     from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 except Exception:
     FSDP = None
-
 from peft.utils.save_and_load import get_peft_model_state_dict
 
 
-def dist_is_init() -> bool:
-    return torch.distributed.is_initialized()
-
-
-def allreduce_any_true(flag: bool, device: torch.device) -> bool:
-    """Return True if any rank has True (uses MAX over {0,1})."""
-    if not dist_is_init():
-        return bool(flag)
-    t = torch.tensor([1 if flag else 0], device=device, dtype=torch.int32)
-    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
-    return bool(t.item())
-
-
-def grad_total_norm(model: Module, norm_type: float = 2.0) -> float:
-    total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            pn = p.grad.data.norm(norm_type)
-            v = float(pn.item())
-            total += v ** norm_type
-    return total ** (1.0 / norm_type) if total > 0.0 else 0.0
-
-
 class Trainer:
+
     def __init__(
         self,
         model: Module,
@@ -59,6 +38,7 @@ class Trainer:
         use_bf16: bool = True,
         device: Optional[torch.device] = None,
         save_optimizer_state: bool = False, # toggle to also save opt/sched state_dict
+        precision: str = "bf16",  
     ):
         self.model = model
         self.optimizer = optimizer
@@ -68,26 +48,21 @@ class Trainer:
         self.device = device or torch.device(f"cuda:{rank}")
         self.total_steps = total_steps
         self.scheduler = scheduler
-        self.accumulation_steps = max(1, int(accumulation_steps))
+        self.accumulation_steps = max(1, accumulation_steps)
         self.output_dir = save_model_path
-        self.log_freq = int(log_freq)
-        self.save_steps = max(1, int(save_steps))
+        self.log_freq = log_freq
+        self.save_steps = max(1, save_steps)
         self.save_optimizer_state = save_optimizer_state
         self.max_grad_norm = float(max_grad_norm)
         self.global_step = 0
         self.best_loss = math.inf
 
-        # Precision / AMP policy
-        self.dtype = torch.bfloat16 if use_bf16 else torch.float16
-        # Detect fp32 runs (e.g., FSDP constructed with mixed_precision=None)
-        is_fp32_run = all((p.dtype == torch.float32) for p in self.model.parameters() if p.requires_grad)
-        if is_fp32_run:
-            self.amp_ctx = nullcontext()
-            self.scaler = None
-            self.dtype = torch.float32
-        else:
-            self.amp_ctx = autocast(device_type="cuda", dtype=self.dtype)
-            self.scaler = None if use_bf16 else GradScaler()
+        # Mixed precision policy
+        self.precision = ("bf16" if use_bf16 is True else
+                        "fp16" if use_bf16 is False else "fp32")  # or add an explicit flag
+        self.dtype = torch.bfloat16 if self.precision == "bf16" else (
+                    torch.float16 if self.precision == "fp16" else torch.float32)
+        self.scaler = None if self.precision != "fp16" else GradScaler()
 
         if self.rank == 0:
             os.makedirs(self.output_dir, exist_ok=True)
@@ -104,9 +79,8 @@ class Trainer:
         return getattr(m, "module", m)
 
     def _save_checkpoint(self, tag: str, metrics: Optional[Dict[str, float]] = None):
-        # Save only on rank 0 to avoid races
-        if self.rank != 0:
-            return
+        # if self.rank != 0:
+        #     return
 
         ckpt_dir = os.path.join(self.output_dir, f"ckpt-{tag}")
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -115,22 +89,27 @@ class Trainer:
             model_for_sd = self.model  # could be FSDP-wrapped
             unwrapped = getattr(model_for_sd, "module", model_for_sd)
 
+            # 1) Build a CPU, rank0-only full state_dict if FSDP is present and the model is wrapped
             use_fsdp_ctx = FSDP is not None and isinstance(model_for_sd, FSDP)
             if use_fsdp_ctx:
                 full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
                 with FSDP.state_dict_type(model_for_sd, StateDictType.FULL_STATE_DICT, full_cfg):
                     base_sd = model_for_sd.state_dict()
             else:
+                # Not wrapped (or FSDP not available) → normal CPU state_dict
                 base_sd = {k: v.cpu() for k, v in model_for_sd.state_dict().items()}
 
+            # 2) Filter to adapter-only weights (LoRA)
             peft_sd = get_peft_model_state_dict(model_for_sd, state_dict=base_sd)
 
+            # 3) Let PEFT write everything (adapter_model.safetensors + adapter_config.json)
             unwrapped.save_pretrained(
                 ckpt_dir,
                 state_dict=peft_sd,
                 safe_serialization=True,
             )
 
+            # 4) Small training meta
             torch.save(
                 {"global_step": self.global_step, "best_loss": self.best_loss, "metrics": metrics or {}},
                 os.path.join(ckpt_dir, "training_state.pt"),
@@ -140,6 +119,7 @@ class Trainer:
 
         except Exception as e:
             self.logger.print(f"❌ Adapter checkpoint failed: {e}")
+
 
     def checkpoint_step(self, loss_val: float):
         if (self.global_step % self.save_steps) == 0 and self.global_step > 0:
@@ -162,7 +142,13 @@ class Trainer:
         if labels is not None:
             labels = labels.to(self.device, non_blocking=True)
 
-        with self.amp_ctx:
+        # Use AMP only in bf16/fp16; disable for fp32
+        amp_ctx = (
+            autocast(device_type="cuda", dtype=self.dtype)
+            if self.precision in ("bf16", "fp16") else nullcontext()
+        )
+
+        with amp_ctx:
             if labels is not None:
                 out = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = out.loss
@@ -177,6 +163,7 @@ class Trainer:
                 )
         return loss
 
+
     # ---------------------
     # Train Loop
     # ---------------------
@@ -185,16 +172,12 @@ class Trainer:
         running_loss = 0.0
         running_count = 0
 
-        # Accumulation-scope health flag (OR of microstep flags)
-        accum_bad = False
-
         for step, batch in enumerate(self.dataloader):
             is_accum_start = (step % self.accumulation_steps) == 0
             is_accum_end = ((step + 1) % self.accumulation_steps) == 0
 
             if is_accum_start:
                 self.optimizer.zero_grad(set_to_none=True)
-                accum_bad = False  # reset at the start of each accumulation window
 
             maybe_no_sync = (
                 self.model.no_sync
@@ -214,52 +197,46 @@ class Trainer:
                 running_loss += float(loss.detach().item())
                 running_count += 1
 
-                if is_accum_start and getattr(self.logger, "is_main", False):
+                if is_accum_start and self.logger.is_main:
                     lr = self.optimizer.param_groups[0]["lr"]
                     self.logger.print(f"Epoch {epoch} Step {step} Loss: {loss.item():.4f} LR: {lr:.6f}")
-                    if hasattr(self.logger, "wb"):
-                        self.logger.wb("log", metrics={"train/loss": loss.item(), "train/lr": lr}, step=self.global_step)
+                    self.logger.wb("log", metrics={"train/loss": loss.item(), "train/lr": lr}, step=self.global_step)
 
-                # Local finite check (no collectives here)
-                local_bad = (not torch.isfinite(loss))
-                if local_bad and getattr(self.logger, "is_main", False):
-                    self.logger.print(f"⚠️ Non-finite loss (local) at microstep {step}; will skip at accum boundary.")
-
-                if not local_bad:
-                    loss = loss / self.accumulation_steps
-                    _backward_scaled(loss)
-
-                # OR into accumulation window flag
-                accum_bad = accum_bad or local_bad
-
-            if is_accum_end:
-                # If using fp16 scaler, unscale before norm/clip
-                if self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
-
-                # Compute grad norm locally (ignoring params with None grad)
-                gnorm = grad_total_norm(self.model, norm_type=2.0)
-                local_grad_bad = not math.isfinite(gnorm)
-
-                if local_grad_bad and getattr(self.logger, "is_main", False):
-                    self.logger.print(f"⚠️ Non-finite grad norm (local) at step {self.global_step}: {gnorm}")
-
-                # One tiny all-reduce per *accumulation*, not per microstep
-                any_bad = allreduce_any_true(accum_bad or local_grad_bad, self.device)
-
-                if any_bad:
-                    # All ranks agree to skip the whole step
+                if not torch.isfinite(loss):
+                    if self.logger.is_main:
+                        self.logger.print(f"⚠️ Non-finite loss at step {self.global_step}: {loss.item()} — skipping.")
                     self.optimizer.zero_grad(set_to_none=True)
                     if self.scheduler is not None:
                         self.scheduler.step()
-                    if getattr(self.logger, "is_main", False):
-                        self.logger.print(f"⏭️  Skipped optimizer step {self.global_step} (bad loss/grad in window).")
                     self.global_step += 1
                     continue
 
-                # Safe to clip/step (all ranks)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                loss = loss / self.accumulation_steps
+                _backward_scaled(loss)
 
+            if is_accum_end:
+                # If using AMP+scaler, unscale first so the grad norm is in real units
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+
+                # Clip and capture the total grad norm
+                total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                # Bail out cleanly on non-finite gradients
+                if not torch.isfinite(total_norm):
+                    if self.logger.is_main:
+                        self.logger.print(
+                            f"⚠️ Non-finite grad norm at step {self.global_step}: {total_norm} — skipping step."
+                        )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    if self.scaler is not None:
+                        self.scaler.update()  # advance scaler even when skipping
+                    self.global_step += 1
+                    continue
+
+                # Step as usual
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -269,42 +246,44 @@ class Trainer:
                 if self.scheduler is not None:
                     self.scheduler.step()
 
-                if getattr(self.logger, "is_main", False):
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    if hasattr(self.logger, "wb"):
-                        self.logger.wb("log", metrics={"train/lr": lr}, step=self.global_step)
+                lr = self.optimizer.param_groups[0]["lr"]
+                if self.logger.is_main and (step % self.accumulation_steps) == 0:
+                    self.logger.wb("log", metrics={"train/lr": lr}, step=self.global_step)
+                
 
-                self.global_step += 1  # only bump at accumulation boundary
+            self.global_step += 1
 
-            # Step-based checkpointing/progress (uses average over *seen* microsteps)
+            # Step-based checkpointing
             avg_loss = running_loss / max(1, running_count)
             self.checkpoint_step(loss_val=avg_loss)
 
             # Periodic lightweight save for visibility
-            if (self.global_step % self.log_freq == 0) and getattr(self.logger, "is_main", False):
+            if (self.global_step % self.log_freq == 0) and self.logger.is_main:
                 self.logger.print("Periodic save (log_freq).")
                 self._save_checkpoint(tag=f"logfreq-{self.global_step}", metrics={"loss": avg_loss})
 
         # End-of-epoch checkpoint + best tracker
         epoch_avg = running_loss / max(1, running_count)
-        if getattr(self.logger, "is_main", False):
+        if self.logger.is_main:
             self.logger.print(f"Epoch {epoch} average loss: {epoch_avg:.4f}")
         self._save_checkpoint(tag=f"epoch-{epoch}", metrics={"epoch_loss": epoch_avg})
         self._maybe_update_best(epoch_avg)
 
-        # If epoch ended mid-accumulation, finalize a leftover step consistently
+        # Finalize leftover grads if the epoch ended mid-accumulation
         remainder = len(self.dataloader) % self.accumulation_steps
         if remainder != 0:
-            # We didn’t hit the end-of-accum boundary; perform a consistent “skip” for safety.
-            self.optimizer.zero_grad(set_to_none=True)
+            if self.scaler is not None:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
-            self.global_step += 1
 
     def train(self, epochs: int):
         for epoch in range(epochs):
             self.epoch(epoch)
-        # Always save a "last" checkpoint at the end (rank 0)
-        if getattr(self.logger, "is_main", False):
+        # Always save a "last" checkpoint at the end
+        if self.logger.is_main:
             self._save_checkpoint(tag="last")
             self.logger.print("🏁 Training complete.")
